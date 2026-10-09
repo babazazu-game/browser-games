@@ -1,332 +1,40 @@
-/* Merge-оборона — вся логика игры в одном файле. */
-const WIDTH = 900, HEIGHT = 650, COLS = 10, ROWS = 7, CELL = 64;
-const GX = 130, GY = 112;
-
-const TOWERS = {
-  archer: { name: 'Лучник', price: 50, damage: 12, range: 118, cooldown: 620, color: 0x62b94f, frame: 0 },
-  cannon: { name: 'Пушка', price: 75, damage: 27, range: 105, cooldown: 1050, color: 0xe18a36, frame: 1 },
-  mage:   { name: 'Маг', price: 100, damage: 19, range: 138, cooldown: 820, color: 0x8b62dc, frame: 2 }
-};
-const ENEMIES = {
-  normal: { hp: 62, speed: 55, reward: 12, frame: 3, color: 0xd9574f },
-  fast:   { hp: 42, speed: 92, reward: 14, frame: 4, color: 0xe7bd3b },
-  tank:   { hp: 145, speed: 37, reward: 20, frame: 5, color: 0x59416f }
-};
-
-// Клетки пути задают строгий серпантин сверху вниз.
-const pathCells = [];
-for (let x = 0; x < COLS; x++) pathCells.push([x, 0]);
-for (let y = 1; y <= 2; y++) pathCells.push([9, y]);
-for (let x = 8; x >= 0; x--) pathCells.push([x, 2]);
-for (let y = 3; y <= 4; y++) pathCells.push([0, y]);
-for (let x = 1; x < COLS; x++) pathCells.push([x, 4]);
-for (let y = 5; y <= 6; y++) pathCells.push([9, y]);
-for (let x = 8; x >= 4; x--) pathCells.push([x, 6]);
-const roadSet = new Set(pathCells.map(([x, y]) => `${x},${y}`));
-const center = ([x, y]) => ({ x: GX + x * CELL + CELL / 2, y: GY + y * CELL + CELL / 2 });
-const waypoints = [{ x: center(pathCells[0]).x, y: GY - 42 }, ...pathCells.map(center),
-  { x: center(pathCells.at(-1)).x, y: GY + ROWS * CELL + 44 }];
-
-class GameScene extends Phaser.Scene {
-  constructor() { super('game'); }
-
-  preload() {
-    this.load.spritesheet('atlas', 'assets/sprites.png', { frameWidth: 512, frameHeight: 512 });
-  }
-
-  create() {
-    this.gold = 150; this.baseHP = 20; this.wave = 0; this.paused = false;
-    this.gameOver = false; this.enemies = []; this.towers = []; this.menu = null;
-    this.waveActive = false; this.spawnLeft = 0; this.nextWaveAt = this.time.now + 2500;
-    this.audioCtx = null;
-
-    this.makeFallbackTextures();
-    this.drawBoard();
-    this.createUI();
-    this.input.on('pointerdown', () => this.ensureAudio(), this);
-
-    this.input.on('dragstart', (_, tower) => {
-      if (this.paused || this.gameOver || !tower.getData('tower')) return;
-      tower.setData('dragged', true).setDepth(30).setAlpha(0.82);
-    });
-    this.input.on('drag', (_, tower, x, y) => {
-      if (tower.getData('tower')) tower.setPosition(x, y);
-    });
-    this.input.on('dragend', (_, tower) => this.finishDrag(tower));
-    this.updateUI();
-  }
-
-  makeFallbackTextures() {
-    const make = (key, color, enemy = false) => {
-      if (this.textures.exists(key)) return;
-      const g = this.make.graphics({ add: false });
-      g.fillStyle(0x000000, .25).fillCircle(34, 37, 24);
-      g.fillStyle(color).fillCircle(32, 32, enemy ? 23 : 26);
-      g.lineStyle(4, enemy ? 0x301d1d : 0xe7d19b, 1).strokeCircle(32, 32, enemy ? 21 : 25);
-      if (enemy) g.fillStyle(0xffffff).fillCircle(24, 28, 4).fillCircle(40, 28, 4);
-      else g.fillStyle(0x3b3026).fillRect(28, 12, 8, 40);
-      g.generateTexture(key, 64, 64); g.destroy();
-    };
-    Object.entries(TOWERS).forEach(([k, v]) => make(`fallback-${k}`, v.color));
-    Object.entries(ENEMIES).forEach(([k, v]) => make(`fallback-${k}`, v.color, true));
-  }
-
-  drawBoard() {
-    const bg = this.add.graphics();
-    bg.fillGradientStyle(0x173322, 0x173322, 0x0d2218, 0x0d2218, 1).fillRect(0, 0, WIDTH, HEIGHT);
-    bg.fillStyle(0x294f32).fillRoundedRect(GX - 16, GY - 16, COLS * CELL + 32, ROWS * CELL + 32, 18);
-    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
-      const road = roadSet.has(`${x},${y}`), px = GX + x * CELL, py = GY + y * CELL;
-      bg.fillStyle(road ? 0x9a7953 : ((x + y) % 2 ? 0x478b4c : 0x509a54));
-      bg.fillRoundedRect(px + 2, py + 2, CELL - 4, CELL - 4, 8);
-      bg.lineStyle(1, road ? 0xb79a70 : 0x6aad66, .45).strokeRoundedRect(px + 2, py + 2, CELL - 4, CELL - 4, 8);
-      if (!road) {
-        const hit = this.add.rectangle(px + CELL / 2, py + CELL / 2, CELL - 5, CELL - 5, 0xffffff, .001)
-          .setInteractive({ useHandCursor: true });
-        hit.setData({ cx: x, cy: y });
-        hit.on('pointerover', () => hit.setFillStyle(0xd8f1a0, .18));
-        hit.on('pointerout', () => hit.setFillStyle(0xffffff, .001));
-        hit.on('pointerdown', (p) => { p.event.stopPropagation(); this.openBuildMenu(x, y); });
-      }
-    }
-    this.add.text(GX + 8, GY - 35, 'ВХОД', { fontSize: '16px', color: '#ffd99b', fontStyle: 'bold' });
-    const end = waypoints.at(-1);
-    this.add.circle(end.x, end.y, 31, 0x4c72bd).setStrokeStyle(5, 0xb9d2ff);
-    this.add.text(end.x, end.y, 'БАЗА', { fontSize: '12px', color: '#fff', fontStyle: 'bold' }).setOrigin(.5);
-  }
-
-  createUI() {
-    this.add.rectangle(WIDTH / 2, 45, WIDTH - 40, 70, 0x101918, .96).setStrokeStyle(2, 0x4d7859);
-    const style = { fontSize: '22px', color: '#f4f0da', fontStyle: 'bold' };
-    this.goldText = this.add.text(48, 45, '', style).setOrigin(0, .5);
-    this.waveText = this.add.text(330, 45, '', style).setOrigin(0, .5);
-    this.hpText = this.add.text(565, 45, '', style).setOrigin(0, .5);
-    this.pauseBtn = this.add.text(820, 45, '⏸', { fontSize: '28px', color: '#fff', backgroundColor: '#31543d', padding: { x: 12, y: 5 } })
-      .setOrigin(.5).setInteractive({ useHandCursor: true }).on('pointerdown', () => this.togglePause());
-    this.statusText = this.add.text(WIDTH / 2, 88, '', { fontSize: '18px', color: '#ffe7a4', fontStyle: 'bold' }).setOrigin(.5);
-  }
-
-  openBuildMenu(cx, cy) {
-    if (this.paused || this.gameOver || this.towerAt(cx, cy)) return;
-    this.closeMenu();
-    const px = GX + cx * CELL + CELL / 2, py = GY + cy * CELL + CELL / 2;
-    const menuY = Phaser.Math.Clamp(py, 150, HEIGHT - 80);
-    const c = this.add.container(Phaser.Math.Clamp(px, 155, WIDTH - 155), menuY).setDepth(50);
-    c.add(this.add.rectangle(0, 0, 300, 70, 0x101918, .98).setStrokeStyle(2, 0xe5c875));
-    Object.entries(TOWERS).forEach(([key, t], i) => {
-      const x = -100 + i * 100;
-      const button = this.add.rectangle(x, 0, 92, 58, t.color, .82).setInteractive({ useHandCursor: true });
-      const label = this.add.text(x, -12, t.name, { fontSize: '14px', color: '#fff', fontStyle: 'bold' }).setOrigin(.5);
-      const price = this.add.text(x, 12, `${t.price} 🪙`, { fontSize: '13px', color: '#ffe6a1' }).setOrigin(.5);
-      button.on('pointerdown', (p) => { p.event.stopPropagation(); this.buyTower(key, cx, cy); });
-      c.add([button, label, price]);
-    });
-    this.menu = c;
-  }
-
-  closeMenu() { if (this.menu) this.menu.destroy(true); this.menu = null; }
-
-  buyTower(type, cx, cy) {
-    const cfg = TOWERS[type];
-    if (this.gold < cfg.price) { this.flashStatus('Не хватает золота!', '#ff9d91'); return; }
-    if (this.towerAt(cx, cy)) return this.closeMenu();
-    this.gold -= cfg.price; this.createTower(type, 1, cx, cy); this.closeMenu(); this.updateUI();
-  }
-
-  makeSprite(kind, type, frame, size) {
-    const atlasOK = this.textures.exists('atlas') && this.textures.get('atlas').key !== '__MISSING';
-    const obj = atlasOK ? this.add.image(0, 0, 'atlas', frame) : this.add.image(0, 0, `fallback-${type}`);
-    obj.setDisplaySize(size, size);
-    return obj;
-  }
-
-  createTower(type, level, cx, cy) {
-    const pos = center([cx, cy]), cfg = TOWERS[type];
-    const tower = this.add.container(pos.x, pos.y).setSize(58, 58).setInteractive({ useHandCursor: true });
-    const sprite = this.makeSprite('tower', type, cfg.frame, 60);
-    const badge = this.add.circle(20, 20, 12, 0x101918, .95).setStrokeStyle(2, 0xffdc71);
-    const levelText = this.add.text(20, 20, `${level}`, { fontSize: '14px', color: '#fff', fontStyle: 'bold' }).setOrigin(.5);
-    tower.add([sprite, badge, levelText]);
-    tower.setData({ tower: true, type, level, cx, cy, homeX: pos.x, homeY: pos.y, nextShot: 0, levelText, dragged: false });
-    this.input.setDraggable(tower); this.towers.push(tower); return tower;
-  }
-
-  finishDrag(tower) {
-    if (!tower.active || !tower.getData('tower')) return;
-    const target = this.towers.find(t => t !== tower && t.active && Phaser.Math.Distance.Between(t.x, t.y, tower.x, tower.y) < 38);
-    const same = target && target.getData('type') === tower.getData('type') && target.getData('level') === tower.getData('level');
-    if (same && target.getData('level') < 5) {
-      const level = target.getData('level') + 1;
-      target.setData('level', level); target.getData('levelText').setText(level);
-      this.tweens.add({ targets: target, scale: 1.35, duration: 150, yoyo: true });
-      this.towers = this.towers.filter(t => t !== tower); tower.destroy(true);
-      this.flashStatus(`Слияние! ${TOWERS[target.getData('type')].name} — уровень ${level}`, '#aef5b0');
-      this.soundEffect('merge');
-    } else {
-      if (same) this.flashStatus('Максимальный уровень — 5', '#ffe3a3');
-      this.tweens.add({ targets: tower, x: tower.getData('homeX'), y: tower.getData('homeY'), duration: 180, ease: 'Back.out' });
-      tower.setDepth(5).setAlpha(1).setData('dragged', false);
-    }
-  }
-
-  towerAt(cx, cy) { return this.towers.find(t => t.active && t.getData('cx') === cx && t.getData('cy') === cy); }
-
-  startWave() {
-    if (this.wave >= 10) return;
-    this.wave++; this.waveActive = true; this.spawnLeft = 6 + this.wave * 2;
-    this.spawnTimer = 0; this.updateUI(); this.soundEffect('wave');
-    this.flashStatus(`Волна ${this.wave} начинается!`, '#ffe28a');
-  }
-
-  spawnEnemy() {
-    const n = (6 + this.wave * 2) - this.spawnLeft;
-    const type = n % 5 === 4 ? 'tank' : n % 3 === 2 ? 'fast' : 'normal';
-    const cfg = ENEMIES[type], hp = Math.round(cfg.hp * Math.pow(1.3, this.wave - 1));
-    const sprite = this.makeSprite('enemy', type, cfg.frame, type === 'tank' ? 58 : 50).setPosition(waypoints[0].x, waypoints[0].y).setDepth(10);
-    sprite.setData({ enemy: true, type, hp, maxHp: hp, speed: cfg.speed, reward: cfg.reward, wp: 1 });
-    const barBg = this.add.rectangle(sprite.x, sprite.y - 30, 48, 6, 0x351d1d).setDepth(11);
-    const bar = this.add.rectangle(sprite.x - 24, sprite.y - 30, 48, 6, 0x79d66f).setOrigin(0, .5).setDepth(12);
-    sprite.setData('barBg', barBg); sprite.setData('bar', bar);
-    this.enemies.push(sprite);
-  }
-
-  update(time, delta) {
-    if (this.paused || this.gameOver) return;
-    if (!this.waveActive && time >= this.nextWaveAt) this.startWave();
-    if (this.waveActive && this.spawnLeft > 0) {
-      this.spawnTimer -= delta;
-      if (this.spawnTimer <= 0) { this.spawnEnemy(); this.spawnLeft--; this.spawnTimer = Math.max(420, 900 - this.wave * 25); }
-    }
-    this.moveEnemies(delta);
-    this.updateTowers(time);
-    if (this.waveActive && this.spawnLeft === 0 && this.enemies.length === 0) {
-      this.waveActive = false;
-      if (this.wave === 10) this.finishGame(true);
-      else { this.nextWaveAt = time + 10000; this.flashStatus('Передышка: 10 секунд', '#b8e4ff'); }
-    }
-    if (!this.waveActive && this.wave < 10) {
-      const left = Math.max(0, Math.ceil((this.nextWaveAt - time) / 1000));
-      this.statusText.setText(`Следующая волна через ${left} сек.`);
-    }
-  }
-
-  moveEnemies(delta) {
-    [...this.enemies].forEach(e => {
-      if (!e.active) return;
-      const p = waypoints[e.getData('wp')], dist = Phaser.Math.Distance.Between(e.x, e.y, p.x, p.y);
-      const step = e.getData('speed') * delta / 1000;
-      if (dist <= step + 1) {
-        e.setPosition(p.x, p.y); e.setData('wp', e.getData('wp') + 1);
-        if (e.getData('wp') >= waypoints.length) this.enemyReachedBase(e);
-      } else {
-        const a = Phaser.Math.Angle.Between(e.x, e.y, p.x, p.y);
-        e.x += Math.cos(a) * step; e.y += Math.sin(a) * step;
-      }
-      if (e.active) { e.getData('barBg').setPosition(e.x, e.y - 30); e.getData('bar').setPosition(e.x - 24, e.y - 30); }
-    });
-  }
-
-  updateTowers(time) {
-    this.towers.forEach(t => {
-      if (!t.active || t.getData('dragged') || time < t.getData('nextShot')) return;
-      const cfg = TOWERS[t.getData('type')], level = t.getData('level');
-      const range = cfg.range * Math.pow(1.2, level - 1);
-      const target = this.enemies.filter(e => e.active && e.getData('hp') > 0 && Phaser.Math.Distance.Between(t.x, t.y, e.x, e.y) <= range)
-        .sort((a, b) => b.getData('wp') - a.getData('wp'))[0];
-      if (target) {
-        t.setData('nextShot', time + cfg.cooldown * Math.pow(.94, level - 1));
-        this.fire(t, target, cfg.damage * Math.pow(2, level - 1), cfg.color);
-      }
-    });
-  }
-
-  fire(tower, target, damage, color) {
-    const shot = this.add.circle(tower.x, tower.y, tower.getData('type') === 'cannon' ? 7 : 4, color).setDepth(20);
-    this.soundEffect('shot', tower.getData('type'));
-    this.tweens.add({ targets: shot, x: target.x, y: target.y, duration: 130, onComplete: () => {
-      shot.destroy(); if (target.active) this.damageEnemy(target, damage);
-    }});
-  }
-
-  damageEnemy(enemy, damage) {
-    const hp = enemy.getData('hp') - damage; enemy.setData('hp', hp);
-    enemy.getData('bar').displayWidth = 48 * Math.max(0, hp / enemy.getData('maxHp'));
-    enemy.setTintFill(0xffffff); this.time.delayedCall(55, () => enemy.active && enemy.clearTint());
-    if (hp <= 0) {
-      this.gold += enemy.getData('reward'); this.soundEffect('death');
-      this.tweens.add({ targets: enemy, alpha: 0, scale: .3, duration: 180, onComplete: () => this.removeEnemy(enemy) });
-      enemy.setData('hp', -999999); this.enemies = this.enemies.filter(e => e !== enemy); this.updateUI();
-    }
-  }
-
-  removeEnemy(enemy) {
-    if (!enemy.active) return;
-    enemy.getData('barBg').destroy(); enemy.getData('bar').destroy();
-    enemy.destroy();
-  }
-
-  enemyReachedBase(enemy) {
-    this.enemies = this.enemies.filter(e => e !== enemy); this.removeEnemy(enemy);
-    this.baseHP--; this.cameras.main.shake(120, .006); this.updateUI();
-    if (this.baseHP <= 0) this.finishGame(false);
-  }
-
-  togglePause() {
-    if (this.gameOver) return;
-    this.paused = !this.paused; this.pauseBtn.setText(this.paused ? '▶' : '⏸');
-    if (this.paused) {
-      this.pausedAt = this.time.now;
-      this.physics?.pause(); this.tweens.pauseAll(); this.statusText.setText('ПАУЗА');
-    } else {
-      // Сдвигаем абсолютный таймер, чтобы пауза не съедала время перед волной.
-      if (!this.waveActive) this.nextWaveAt += this.time.now - this.pausedAt;
-      this.physics?.resume(); this.tweens.resumeAll();
-    }
-  }
-
-  finishGame(win) {
-    this.gameOver = true; this.closeMenu();
-    const shade = this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x07100c, .82).setDepth(100);
-    const title = this.add.text(WIDTH / 2, HEIGHT / 2 - 45, win ? 'ПОБЕДА!' : 'ПОРАЖЕНИЕ', {
-      fontSize: '58px', color: win ? '#ffe278' : '#ff8a80', fontStyle: 'bold'
-    }).setOrigin(.5).setDepth(101);
-    this.add.text(WIDTH / 2, HEIGHT / 2 + 30, win ? 'Все 10 волн отбиты' : 'База разрушена', { fontSize: '24px', color: '#fff' }).setOrigin(.5).setDepth(101);
-    const again = this.add.text(WIDTH / 2, HEIGHT / 2 + 95, 'Играть снова', { fontSize: '22px', color: '#132016', backgroundColor: '#d7e99d', padding: { x: 22, y: 12 } })
-      .setOrigin(.5).setDepth(101).setInteractive({ useHandCursor: true }).on('pointerdown', () => this.scene.restart());
-  }
-
-  updateUI() {
-    this.goldText.setText(`🪙 Золото: ${this.gold}`);
-    this.waveText.setText(`Волна: ${this.wave}/10`);
-    this.hpText.setText(`💙 База: ${this.baseHP}/20`);
-  }
-
-  flashStatus(text, color = '#ffe7a4') {
-    this.statusText.setColor(color).setText(text);
-    this.time.delayedCall(1800, () => { if (!this.gameOver && this.waveActive) this.statusText.setText(''); });
-  }
-
-  ensureAudio() {
-    if (!this.audioCtx) this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    if (this.audioCtx.state === 'suspended') this.audioCtx.resume();
-  }
-
-  // Мягкие синтезированные звуки: синусоидальные тоны с фильтрацией и плавным спадом.
-  soundEffect(kind, variant = '') {
-    this.ensureAudio(); const c = this.audioCtx, now = c.currentTime;
-    const osc = c.createOscillator(), gain = c.createGain(), filter = c.createBiquadFilter();
-    osc.type = kind === 'death' ? 'triangle' : 'sine';
-    const freq = kind === 'wave' ? 260 : kind === 'death' ? 155 : kind === 'merge' ? 420 : variant === 'cannon' ? 90 : variant === 'mage' ? 520 : 330;
-    osc.frequency.setValueAtTime(freq, now);
-    osc.frequency.exponentialRampToValueAtTime(kind === 'wave' || kind === 'merge' ? freq * 1.7 : Math.max(45, freq * .58), now + .22);
-    filter.type = 'lowpass'; filter.frequency.value = kind === 'shot' ? 1100 : 1500; filter.Q.value = .7;
-    gain.gain.setValueAtTime(.0001, now); gain.gain.exponentialRampToValueAtTime(.09, now + .018); gain.gain.exponentialRampToValueAtTime(.0001, now + .28);
-    osc.connect(filter).connect(gain).connect(c.destination); osc.start(now); osc.stop(now + .3);
-  }
+const WIDTH=1280,HEIGHT=720,COLS=12,ROWS=8,CELL=68,OX=232,OY=62;
+const PATH=[[6,0],[7,0],[8,0],[9,0],[9,1],[9,2],[8,2],[7,2],[6,2],[5,2],[4,2],[3,2],[2,2],[2,3],[2,4],[3,4],[4,4],[5,4],[6,4],[7,4],[8,4],[9,4],[9,5],[9,6],[8,6],[7,6],[6,6],[5,6],[4,6],[3,6],[3,7]],PATHSET=new Set(PATH.map(p=>p.join(',')));
+const TD={archer:{name:'ЛУЧНИЦА',price:50,color:0x62c86a,range:170,damage:15,rate:780},cannon:{name:'ПУШКА',price:75,color:0xf0a53a,range:145,damage:31,rate:1350},mage:{name:'МАГ',price:100,color:0x55bdf4,range:195,damage:20,rate:1050}};
+const ED={goblin:{hp:48,speed:54,reward:12,damage:1,scale:.42},wolf:{hp:34,speed:88,reward:14,damage:1,scale:.30},troll:{hp:145,speed:33,reward:25,damage:2,scale:.32}};
+class BattleScene extends Phaser.Scene{
+ constructor(){super('battle')}
+ preload(){this.load.atlas('characters','assets/characters.png','assets/characters.json');this.load.spritesheet('units','assets/units-v2.png',{frameWidth:362,frameHeight:362});this.load.image('arrow','assets/arrow.png');this.load.on('loaderror',f=>this.assetError(`Не загружен ресурс: ${f.key}`))}
+ create(){this.gold=150;this.baseHP=20;this.wave=0;this.maxWaves=10;this.paused=false;this.gameOver=false;this.towers=[];this.enemies=[];this.buildMenu=null;this.dragTower=null;this.waveScheduled=false;this.pendingSpawns=0;this.makeAnims();this.drawWorld();this.createUI();this.setupInput();this.addTower(1,1,'archer',1);this.time.delayedCall(2200,()=>this.startWave())}
+ makeAnims(){const a=(key,prefix,end,rate,repeat)=>this.anims.create({key,frames:this.anims.generateFrameNames('characters',{prefix,start:0,end,zeroPad:2}),frameRate:rate,repeat});a('archer-idle','archer_idle_',3,5,-1);a('archer-attack','archer_attack_',3,11,0);a('goblin-walk','goblin_walk_',5,9,-1);a('goblin-death','goblin_death_',5,9,0)}
+ pos(c,r){return{x:OX+c*CELL+CELL/2,y:OY+r*CELL+CELL/2}}
+ drawWorld(){const g=this.add.graphics();g.fillGradientStyle(0x143b2e,0x143b2e,0x071f1b,0x071f1b).fillRect(0,0,WIDTH,HEIGHT);g.fillStyle(0x224f3a).fillRoundedRect(OX-20,OY-20,COLS*CELL+40,ROWS*CELL+40,28);g.fillStyle(0x6da946).fillRoundedRect(OX-8,OY-8,COLS*CELL+16,ROWS*CELL+16,20);
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){const p=this.pos(c,r),path=PATHSET.has(`${c},${r}`);if(path){g.fillStyle(0x9a7654).fillRoundedRect(p.x-CELL/2+2,p.y-CELL/2+2,CELL-4,CELL-4,12);g.lineStyle(3,0xd7bd8c,.72).strokeRoundedRect(p.x-CELL/2+3,p.y-CELL/2+3,CELL-6,CELL-6,11)}else{g.fillStyle((c+r)%2?0x82bd55:0x76b04c).fillRoundedRect(p.x-CELL/2+3,p.y-CELL/2+3,CELL-6,CELL-6,10);g.lineStyle(2,0x9bd06a,.45).strokeRoundedRect(p.x-CELL/2+4,p.y-CELL/2+4,CELL-8,CELL-8,9)}}
+  g.fillStyle(0x496d38);for(let i=0;i<18;i++)g.fillCircle(55+i*73,35+(i%3)*8,18+(i%4)*3);
+  PATH.slice(2,-2).filter((_,i)=>i%3===0).forEach(cell=>{const n=PATH[PATH.indexOf(cell)+1],a=this.pos(...cell),b=this.pos(...n);this.add.text((a.x+b.x)/2,(a.y+b.y)/2,'➜',{fontSize:'22px',color:'#ffd45b',stroke:'#9d521c',strokeThickness:3}).setOrigin(.5).setRotation(Phaser.Math.Angle.Between(a.x,a.y,b.x,b.y)).setDepth(4).setAlpha(.8)});
+  const s=this.pos(...PATH[0]);this.add.text(s.x,s.y-4,'▼',{fontSize:'38px',fontStyle:'bold',color:'#fff4a9',stroke:'#ad5a21',strokeThickness:6}).setOrigin(.5).setDepth(8);const b=this.pos(...PATH.at(-1));this.add.ellipse(b.x,b.y+17,54,17,0x10221c,.35).setDepth(7);this.add.text(b.x,b.y-3,'◆',{fontSize:'54px',color:'#a7f5ff',stroke:'#157b9d',strokeThickness:6}).setOrigin(.5).setDepth(8);this.add.text(WIDTH/2,25,'ЛЕСНОЙ РУБЕЖ',{fontFamily:'Georgia,serif',fontSize:'25px',fontStyle:'bold',color:'#fff0ad',stroke:'#163727',strokeThickness:7}).setOrigin(.5).setDepth(50)}
+ createUI(){const y=627,g=this.add.graphics().setDepth(1000);g.fillStyle(0x0e2446,.98).fillRoundedRect(24,y,1232,76,20);g.lineStyle(4,0x416aa0).strokeRoundedRect(24,y,1232,76,20);const panel=(x,w)=>{g.fillStyle(0x142e57).fillRoundedRect(x,y+8,w,60,13);g.lineStyle(2,0x294d7d).strokeRoundedRect(x,y+8,w,60,13)};panel(38,270);panel(322,270);panel(606,300);panel(920,110);panel(1042,196);
+  this.goldText=this.add.text(174,y+38,'150',{fontSize:'34px',fontStyle:'bold',color:'#ffe084',stroke:'#5d3213',strokeThickness:5}).setOrigin(.5).setDepth(1002);this.add.text(70,y+38,'●',{fontSize:'42px',color:'#ffc331',stroke:'#8d4b12',strokeThickness:5}).setOrigin(.5).setDepth(1002);this.add.text(101,y+38,'ЗОЛОТО',{fontSize:'14px',fontStyle:'bold',color:'#fff3c9'}).setOrigin(.5).setDepth(1002);this.waveText=this.add.text(457,y+38,'ВОЛНА 0/10',{fontSize:'25px',fontStyle:'bold',color:'#fff'}).setOrigin(.5).setDepth(1002);this.hpText=this.add.text(756,y+38,'БАЗА  ♥ 20',{fontSize:'25px',fontStyle:'bold',color:'#ffdfdf'}).setOrigin(.5).setDepth(1002);this.statusText=this.add.text(640,612,'Кликните по клетке для постройки • Перетащите одинаковые башни для слияния',{fontSize:'15px',color:'#eaffd9'}).setOrigin(.5).setDepth(1002);
+  this.pauseBtn=this.add.text(975,y+38,'Ⅱ',{fontSize:'36px',fontStyle:'bold',color:'#c7f5ff'}).setOrigin(.5).setDepth(1003).setInteractive({useHandCursor:true});this.speedBtn=this.add.text(1140,y+38,'×2  »',{fontSize:'30px',fontStyle:'bold',color:'#fff'}).setOrigin(.5).setDepth(1003).setInteractive({useHandCursor:true});this.pauseBtn.on('pointerdown',()=>{this.paused=!this.paused;this.time.paused=this.paused;if(this.paused)this.tweens.pauseAll();else this.tweens.resumeAll();this.pauseBtn.setText(this.paused?'▶':'Ⅱ');this.statusText.setText(this.paused?'ПАУЗА':'Бой продолжается')});this.fast=false;this.speedBtn.on('pointerdown',()=>{this.fast=!this.fast;this.time.timeScale=this.fast?1.65:1;this.tweens.timeScale=this.fast?1.65:1;this.speedBtn.setColor(this.fast?'#ffe46b':'#fff')})}
+ setupInput(){this.input.on('pointerdown',p=>{if(p.y>=OY&&p.y<OY+ROWS*CELL&&p.x>=OX&&p.x<OX+COLS*CELL){const c=Math.floor((p.x-OX)/CELL),r=Math.floor((p.y-OY)/CELL),t=this.towerAt(c,r);if(t){this.closeMenu();this.dragTower={tower:t,x:t.sprite.x,y:t.sprite.y};t.sprite.setDepth(900)}else if(!PATHSET.has(`${c},${r}`))this.openMenu(c,r);else this.closeMenu()}else if(!this.buildMenu)this.closeMenu()});this.input.on('pointermove',p=>{if(this.dragTower&&p.isDown){const t=this.dragTower.tower;t.sprite.setPosition(p.x,p.y);t.shadow.setPosition(p.x,p.y+19);t.badge.setPosition(p.x+22,p.y+19)}});this.input.on('pointerup',p=>{if(!this.dragTower)return;const d=this.dragTower,t=d.tower,c=Math.floor((p.x-OX)/CELL),r=Math.floor((p.y-OY)/CELL),o=this.towerAt(c,r,t);if(o&&o.type===t.type&&o.level===t.level&&t.level<3)this.merge(t,o);else{t.sprite.setPosition(d.x,d.y);t.shadow.setPosition(d.x,d.y+19);t.badge.setPosition(d.x+22,d.y+19);t.sprite.setDepth(30+t.r)}this.dragTower=null})}
+ openMenu(c,r){this.closeMenu();const p=this.pos(c,r),menu=this.add.container(0,0).setDepth(1500);this.buildMenu=menu;const bg=this.add.graphics();bg.fillStyle(0x10294a,.98).fillRoundedRect(p.x-160,p.y-78,320,92,16);bg.lineStyle(3,0x6ba2d7).strokeRoundedRect(p.x-160,p.y-78,320,92,16);menu.add(bg);['archer','cannon','mage'].forEach((type,i)=>{const x=p.x-105+i*105,y=p.y-35,d=TD[type],b=this.add.rectangle(x,y,92,66,0x1d4570).setStrokeStyle(2,d.color).setInteractive({useHandCursor:true}),icon=this.add.sprite(x,y-9,'units',type==='archer'?0:type==='cannon'?4:8).setScale(.13),tx=this.add.text(x,y+22,`${d.price} ●`,{fontSize:'14px',fontStyle:'bold',color:this.gold>=d.price?'#ffe184':'#8a98aa'}).setOrigin(.5);b.on('pointerdown',(_,a,z,e)=>{e.stopPropagation();this.buy(c,r,type)});menu.add([b,icon,tx])})}
+ closeMenu(){if(this.buildMenu){this.buildMenu.destroy(true);this.buildMenu=null}}
+ buy(c,r,type){const d=TD[type];if(this.gold<d.price){this.statusText.setText('Не хватает золота');return}this.gold-=d.price;this.addTower(c,r,type,1);this.closeMenu();this.refresh()}
+ towerAt(c,r,skip=null){return this.towers.find(t=>t!==skip&&t.c===c&&t.r===r)}
+ addTower(c,r,type,level){const p=this.pos(c,r),shadow=this.add.ellipse(p.x,p.y+19,48,14,0x112016,.32).setDepth(18+r);let sprite;if(type==='archer'&&level===1)sprite=this.add.sprite(p.x,p.y+25,'characters','archer_idle_00').setOrigin(.5,.88).setScale(.42).play('archer-idle');else sprite=this.add.sprite(p.x,p.y+23,'units',(type==='archer'?0:type==='cannon'?4:8)+level-1).setOrigin(.5,.82).setScale(type==='cannon'?.21:.2);sprite.setDepth(30+r).setInteractive({useHandCursor:true});const badge=this.add.text(p.x+22,p.y+19,String(level),{fontSize:'13px',fontStyle:'bold',color:'#fff',backgroundColor:'#8f5515',padding:{x:5,y:2}}).setOrigin(.5).setDepth(45+r),t={c,r,type,level,sprite,shadow,badge,nextShot:0};this.towers.push(t);return t}
+ merge(a,b){this.towers=this.towers.filter(t=>t!==a);a.shadow.destroy();a.badge.destroy();this.tweens.add({targets:a.sprite,x:b.sprite.x,y:b.sprite.y,scale:0,duration:180,onComplete:()=>a.sprite.destroy()});b.level++;b.badge.setText(String(b.level));b.sprite.setTexture('units',(b.type==='archer'?0:b.type==='cannon'?4:8)+b.level-1).setOrigin(.5,.82).setScale(b.type==='cannon'?.21:.2);const f=this.add.circle(b.sprite.x,b.sprite.y,10,0xfff18b,.9).setDepth(950);this.tweens.add({targets:f,scale:6,alpha:0,duration:430,onComplete:()=>f.destroy()});this.pop(b.sprite,1.55);this.statusText.setText(`${TD[b.type].name}: уровень ${b.level}!`)}
+ pop(t,n=1.28){const s=t.scaleX;this.tweens.add({targets:t,scaleX:s*n,scaleY:s*n,duration:150,yoyo:true,ease:'Back.out'})}
+ startWave(){if(this.gameOver||this.wave>=this.maxWaves)return;this.wave++;this.refresh();this.statusText.setText(`Волна ${this.wave} наступает!`);const count=4+this.wave*2;this.pendingSpawns=count;for(let i=0;i<count;i++)this.time.delayedCall(i*Math.max(360,780-this.wave*30),()=>{this.pendingSpawns--;if(!this.gameOver)this.spawn(this.pick(i))})}
+ pick(i){if(this.wave>=4&&i%5===4)return'troll';if(this.wave>=2&&i%3===2)return'wolf';return'goblin'}
+ spawn(type){const d=ED[type],p=this.pos(...PATH[0]),m=1+(this.wave-1)*.18,shadow=this.add.ellipse(p.x,p.y+20,type==='troll'?48:34,12,0x132019,.3).setDepth(20);let sprite;if(type==='goblin')sprite=this.add.sprite(p.x,p.y+24,'characters','goblin_walk_00').setOrigin(.5,.88).setScale(d.scale).play('goblin-walk');else sprite=this.add.sprite(p.x,p.y+21,'units',type==='wolf'?7:11).setOrigin(.5,.82).setScale(d.scale);sprite.setDepth(35);const w=type==='troll'?52:40,bg=this.add.rectangle(p.x,p.y-28,w,6,0x4e1720).setDepth(80),bar=this.add.rectangle(p.x-w/2,p.y-28,w,5,0x67d95a).setOrigin(0,.5).setDepth(81);this.enemies.push({type,hp:d.hp*m,maxHp:d.hp*m,speed:d.speed,pathIndex:0,progress:0,sprite,shadow,bg,bar,dead:false,reward:d.reward})}
+ update(time,delta){if(this.paused||this.gameOver)return;for(const e of[...this.enemies])this.moveEnemy(e,delta/1000,time);for(const t of this.towers){if(time<t.nextShot)continue;const p=this.pos(t.c,t.r),range=TD[t.type].range*(1+.08*(t.level-1)),target=this.enemies.filter(e=>!e.dead&&Phaser.Math.Distance.Between(p.x,p.y,e.sprite.x,e.sprite.y)<=range).sort((a,b)=>b.pathIndex-a.pathIndex)[0];if(target){t.nextShot=time+TD[t.type].rate/(1+.18*(t.level-1));this.fire(t,target)}}if(this.wave>0&&this.pendingSpawns===0&&this.enemies.length===0&&!this.waveScheduled){if(this.wave>=this.maxWaves)this.finish(true);else{this.waveScheduled=true;this.statusText.setText('Волна отбита! Следующая через 4 сек.');this.time.delayedCall(4000,()=>{this.waveScheduled=false;this.startWave()})}}}
+ moveEnemy(e,dt,time){if(e.dead)return;e.progress+=e.speed*dt/CELL;while(e.progress>=1){e.progress--;e.pathIndex++;if(e.pathIndex>=PATH.length-1){this.baseHit(e);return}}const a=this.pos(...PATH[e.pathIndex]),b=this.pos(...PATH[e.pathIndex+1]),x=Phaser.Math.Linear(a.x,b.x,e.progress),y=Phaser.Math.Linear(a.y,b.y,e.progress)+Math.sin(time*.012+e.pathIndex)*3;e.sprite.setPosition(x,y+20).setFlipX(b.x<a.x);e.shadow.setPosition(x,y+22);e.bg.setPosition(x,y-28);e.bar.setPosition(x-e.bg.width/2,y-28);e.sprite.rotation=Math.sin(time*.009)*.035;e.sprite.setDepth(35+Math.round(y/10))}
+ fire(t,e){const p=this.pos(t.c,t.r),d=TD[t.type];if(t.type==='archer'&&t.level===1)t.sprite.play('archer-attack',true).once('animationcomplete',()=>t.sprite.play('archer-idle'));const shot=t.type==='archer'?this.add.image(p.x,p.y-8,'arrow').setScale(.34):this.add.circle(p.x,p.y-8,t.type==='cannon'?8:7,d.color);shot.setDepth(100);this.tweens.add({targets:shot,x:e.sprite.x,y:e.sprite.y-4,duration:t.type==='cannon'?420:270,onComplete:()=>{shot.destroy();if(!e.dead){const damage=d.damage*Math.pow(1.75,t.level-1);if(t.type==='cannon')this.enemies.filter(x=>!x.dead&&Phaser.Math.Distance.Between(x.sprite.x,x.sprite.y,e.sprite.x,e.sprite.y)<58).forEach(x=>this.hit(x,damage));else this.hit(e,damage)}}})}
+ hit(e,d){e.hp-=d;e.bar.width=Math.max(0,e.bg.width*e.hp/e.maxHp);e.sprite.setTintFill(0xffffff);this.time.delayedCall(70,()=>e.sprite.active&&e.sprite.clearTint());if(e.hp<=0)this.kill(e)}
+ kill(e){if(e.dead)return;e.dead=true;this.gold+=e.reward+Math.floor(this.wave/3);this.refresh();e.bar.destroy();e.bg.destroy();if(e.type==='goblin')e.sprite.play('goblin-death');this.tweens.add({targets:e.sprite,alpha:0,angle:18,y:'+=18',duration:440,onComplete:()=>e.sprite.destroy()});this.tweens.add({targets:e.shadow,alpha:0,duration:420,onComplete:()=>e.shadow.destroy()});this.enemies=this.enemies.filter(x=>x!==e)}
+ baseHit(e){this.baseHP-=ED[e.type].damage;[e.sprite,e.shadow,e.bar,e.bg].forEach(x=>x.destroy());this.enemies=this.enemies.filter(x=>x!==e);this.cameras.main.shake(150,.006);this.refresh();if(this.baseHP<=0)this.finish(false)}
+ refresh(){this.goldText.setText(String(this.gold));this.waveText.setText(`ВОЛНА ${this.wave}/${this.maxWaves}`);this.hpText.setText(`БАЗА  ♥ ${Math.max(0,this.baseHP)}`)}
+ finish(win){this.gameOver=true;this.paused=true;const g=this.add.graphics().setDepth(3000);g.fillStyle(0x071624,.88).fillRect(0,0,WIDTH,HEIGHT);g.fillStyle(win?0x244f43:0x642f35).fillRoundedRect(390,245,500,210,28);g.lineStyle(5,win?0xffdd6b:0xff8f8f).strokeRoundedRect(390,245,500,210,28);this.add.text(640,310,win?'ПОБЕДА!':'БАЗА ПАЛА',{fontSize:'46px',fontStyle:'bold',color:'#fff1aa',stroke:'#321c16',strokeThickness:7}).setOrigin(.5).setDepth(3001);this.add.text(640,378,win?'Все 10 волн отбиты':'Попробуйте другую комбинацию башен',{fontSize:'21px',color:'#fff'}).setOrigin(.5).setDepth(3001)}
+ assetError(m){const p=document.getElementById('asset-error');if(p){p.hidden=false;p.textContent=`ОШИБКА ЗАГРУЗКИ СПРАЙТОВ\n${m}`}console.error(m)}
 }
-
-new Phaser.Game({
-  type: Phaser.AUTO, width: WIDTH, height: HEIGHT, parent: document.body,
-  backgroundColor: '#13271b', scene: GameScene,
-  render: { antialias: true, pixelArt: false }, scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH }
-});
+new Phaser.Game({type:Phaser.AUTO,width:WIDTH,height:HEIGHT,backgroundColor:'#101813',parent:'game',scene:BattleScene,scale:{mode:Phaser.Scale.FIT,autoCenter:Phaser.Scale.CENTER_BOTH},render:{antialias:true,pixelArt:false}});
